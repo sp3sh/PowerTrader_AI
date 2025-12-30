@@ -1,6 +1,6 @@
 # ============================================================
-# PowerTrader AI – THINKER
-# Full Rewrite (Trainer-Compatible, Safe, Deterministic)
+# PowerTrader AI – THINKER (Extended)
+# Confidence Scaling · TF Decay · PnL Backtest · Version Sync
 # ============================================================
 
 import os
@@ -10,69 +10,46 @@ import json
 import math
 import base64
 import requests
-import traceback
 import multiprocessing as mp
-from datetime import datetime
+from collections import deque
 from kucoin.client import Market
 from nacl.signing import SigningKey
+
+# ============================================================
+# GLOBAL VERSION CONTRACT
+# ============================================================
+
+THINKER_VERSION = "2.1.0"
+REQUIRED_TRAINER_VERSION = "2.1.0"
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 TF_CHOICES = ['1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
-DISTANCE_PCT = 0.5
-MIN_CONFIDENCE = 0.20        # HARD FLOOR
-MIN_MATCHES = 3             # avoid single-memory hallucinations
+MIN_CONFIDENCE = 0.25
+MIN_MATCHES = 3
+DECAY_LIMIT = 5
+RECOVERY_HITS = 3
 BACKTEST_MODE = os.getenv("POWERTRADER_BACKTEST") == "1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MARKET = Market(url="https://api.kucoin.com")
 
 # ============================================================
-# ROBINHOOD PRICE FEED (LIVE MODE ONLY)
+# CONFIDENCE → SIZE MAP
 # ============================================================
 
-ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
-_RH = None
-
-class RobinhoodMarketData:
-    def __init__(self, api_key, private_b64):
-        raw = base64.b64decode(private_b64.strip())
-        self.key = api_key.strip()
-        self.signer = SigningKey(raw)
-        self.s = requests.Session()
-
-    def _headers(self, method, path, ts):
-        msg = f"{self.key}{ts}{path}{method}"
-        sig = self.signer.sign(msg.encode()).signature
-        return {
-            "x-api-key": self.key,
-            "x-timestamp": str(ts),
-            "x-signature": base64.b64encode(sig).decode(),
-            "Content-Type": "application/json",
-        }
-
-    def ask(self, symbol):
-        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-        ts = int(time.time())
-        r = self.s.get(
-            ROBINHOOD_BASE_URL + path,
-            headers=self._headers("GET", path, ts),
-            timeout=10
-        )
-        r.raise_for_status()
-        return float(r.json()["results"][0]["ask_inclusive_of_buy_spread"])
-
-def robinhood_ask(symbol):
-    global _RH
-    if _RH is None:
-        with open("r_key.txt") as f:
-            k = f.read()
-        with open("r_secret.txt") as f:
-            s = f.read()
-        _RH = RobinhoodMarketData(k, s)
-    return _RH.ask(symbol)
+def size_multiplier(conf):
+    if conf < 0.25:
+        return 0.0
+    if conf < 0.50:
+        return 0.25
+    if conf < 0.75:
+        return 0.50
+    if conf < 1.25:
+        return 0.75
+    return 1.00
 
 # ============================================================
 # UTIL
@@ -87,17 +64,16 @@ def safe_float(x, d=0.0):
     except:
         return d
 
-def log_exc():
-    print(traceback.format_exc())
-
 # ============================================================
-# TRAINING FILE LOADER
+# TRAINING LOADER + HANDSHAKE
 # ============================================================
 
 def load_training(tf):
     try:
-        with open(f"neural_perfect_threshold_{tf}.txt") as f:
-            threshold = float(f.read())
+        with open(f"trainer_version.txt") as f:
+            tv = f.read().strip()
+        if tv != REQUIRED_TRAINER_VERSION:
+            raise RuntimeError("Trainer version mismatch")
 
         with open(f"memories_{tf}.txt") as f:
             memories = f.read().split("~")
@@ -105,171 +81,125 @@ def load_training(tf):
         with open(f"memory_weights_{tf}.txt") as f:
             weights = [safe_float(x) for x in f.read().split()]
 
-        with open(f"memory_weights_high_{tf}.txt") as f:
-            w_high = [safe_float(x) for x in f.read().split()]
+        if len(memories) != len(weights):
+            raise RuntimeError("Memory / weight mismatch")
 
-        with open(f"memory_weights_low_{tf}.txt") as f:
-            w_low = [safe_float(x) for x in f.read().split()]
-
-        return threshold, memories, weights, w_high, w_low
+        return memories, weights
     except:
         return None
 
 # ============================================================
-# CORE SIGNAL ENGINE
+# CORE EVALUATION
 # ============================================================
 
-def evaluate_candle(candle, training):
-    threshold, memories, weights, w_high, w_low = training
-
-    move_sum = 0.0
-    high_sum = 0.0
-    low_sum = 0.0
+def evaluate(candle, training):
+    memories, weights = training
+    score = 0.0
     conf = 0.0
-    matches = 0
+    hits = 0
 
     for i, m in enumerate(memories):
         try:
-            parts = m.split("{}")
-            pat = safe_float(parts[0].split()[-1])
+            pat, move = m.split("{}")
+            pat = safe_float(pat)
+            move = safe_float(move)
             diff = abs(candle - pat)
 
-            if diff <= threshold:
+            if diff < 0.5:
                 w = weights[i]
-                move_sum += pat * w
-                high_sum += safe_float(parts[1]) * w_high[i]
-                low_sum += safe_float(parts[2]) * w_low[i]
+                score += move * w
                 conf += abs(w)
-                matches += 1
+                hits += 1
         except:
             continue
 
-    if matches < MIN_MATCHES or conf < MIN_CONFIDENCE:
+    if hits < MIN_MATCHES or conf < MIN_CONFIDENCE:
         return None
 
-    return {
-        "move": move_sum / conf,
-        "high": high_sum / conf,
-        "low": low_sum / conf,
-        "confidence": conf,
-        "matches": matches
+    return score / conf, conf
+
+# ============================================================
+# THINKER PROCESS (PER COIN)
+# ============================================================
+
+def thinker(sym):
+    os.chdir(coin_dir(sym))
+
+    tf_state = {
+        tf: {
+            "decay": 0,
+            "cooldown": False,
+            "hits": 0
+        } for tf in TF_CHOICES
     }
 
-# ============================================================
-# BACKTEST HARNESS
-# ============================================================
-
-def backtest_coin(sym):
-    os.chdir(coin_dir(sym))
-    results = []
-
-    for tf in TF_CHOICES:
-        training = load_training(tf)
-        if not training:
-            continue
-
-        klines = MARKET.get_kline(f"{sym}-USDT", tf)
-        for k in klines[10:]:
-            o = float(k[1])
-            c = float(k[2])
-            candle = 100 * ((c - o) / o)
-
-            res = evaluate_candle(candle, training)
-            if not res:
-                continue
-
-            results.append({
-                "tf": tf,
-                "confidence": res["confidence"],
-                "matches": res["matches"],
-                "move": res["move"]
-            })
-
-    with open("backtest_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-# ============================================================
-# LIVE THINKER PROCESS (ONE PER COIN)
-# ============================================================
-
-def thinker_process(sym):
-    os.chdir(coin_dir(sym))
-    tf_index = 0
-    state = {tf: {} for tf in TF_CHOICES}
+    pnl_log = []
 
     while True:
-        tf = TF_CHOICES[tf_index]
+        for tf in TF_CHOICES:
+            state = tf_state[tf]
+            if state["cooldown"]:
+                continue
 
-        try:
-            k = MARKET.get_kline(f"{sym}-USDT", tf)
-            o = float(k[0][1])
-            c = float(k[0][2])
+            training = load_training(tf)
+            if not training:
+                continue
+
+            k = MARKET.get_kline(f"{sym}-USDT", tf)[0]
+            o, c = float(k[1]), float(k[2])
             candle = 100 * ((c - o) / o)
-        except:
-            time.sleep(1)
-            continue
 
-        training = load_training(tf)
-        if training:
-            res = evaluate_candle(candle, training)
-        else:
-            res = None
+            res = evaluate(candle, training)
+            if not res:
+                state["decay"] += 1
+                if state["decay"] >= DECAY_LIMIT:
+                    state["cooldown"] = True
+                continue
 
-        state[tf] = res or {"status": "INACTIVE"}
+            move, conf = res
+            size = size_multiplier(conf)
 
-        tf_index = (tf_index + 1) % len(TF_CHOICES)
+            if size == 0:
+                continue
 
-        # full sweep → decision
-        if tf_index == 0 and not BACKTEST_MODE:
-            price = robinhood_ask(f"{sym}-USD")
-            messages = []
+            # Backtest attribution (1 candle forward)
+            if BACKTEST_MODE:
+                next_k = MARKET.get_kline(f"{sym}-USDT", tf)[1]
+                exit_price = float(next_k[2])
+                entry = c
+                pnl = (exit_price - entry) * math.copysign(1, move)
 
-            for tf in TF_CHOICES:
-                r = state[tf]
-                if not r or "move" not in r:
-                    messages.append(f"INACTIVE {tf}")
-                    continue
+                pnl_log.append({
+                    "tf": tf,
+                    "conf": conf,
+                    "size": size,
+                    "pnl": pnl
+                })
 
-                projected = price * (1 + r["move"] / 100)
-                low = projected * (1 - DISTANCE_PCT / 100)
-                high = projected * (1 + DISTANCE_PCT / 100)
+                if pnl > 0:
+                    state["hits"] += 1
+                    if state["hits"] >= RECOVERY_HITS:
+                        state["decay"] = 0
+                        state["cooldown"] = False
 
-                if price > high:
-                    messages.append(f"SHORT {tf}")
-                elif price < low:
-                    messages.append(f"LONG {tf}")
-                else:
-                    messages.append(f"WITHIN {tf}")
+        if BACKTEST_MODE:
+            with open("pnl_attribution.json", "w") as f:
+                json.dump(pnl_log, f, indent=2)
+            break
 
-            with open("thinker_output.txt", "w") as f:
-                f.write("\n".join(messages))
-
-        time.sleep(0.15)
+        time.sleep(0.2)
 
 # ============================================================
 # ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
-    coins = []
-    settings = os.path.join(BASE_DIR, "gui_settings.json")
-    if os.path.isfile(settings):
-        with open(settings) as f:
-            coins = json.load(f).get("coins", [])
-    if not coins:
-        coins = ["BTC", "ETH", "XRP", "BNB", "DOGE"]
+    coins = ["BTC", "ETH", "XRP", "BNB"]
+    procs = []
 
     for c in coins:
         os.makedirs(coin_dir(c), exist_ok=True)
-
-    if BACKTEST_MODE:
-        for c in coins:
-            backtest_coin(c)
-        sys.exit(0)
-
-    procs = []
-    for c in coins:
-        p = mp.Process(target=thinker_process, args=(c,), daemon=True)
+        p = mp.Process(target=thinker, args=(c,), daemon=True)
         p.start()
         procs.append(p)
 
